@@ -19,8 +19,9 @@ export default class AudioEngine {
     this.Tone = Tone;
     this.started = true;
 
-    // Master chain: filter → chorus → reverb → destination
-    this.reverb = new Tone.Reverb({ decay: 12, wet: 0.6 }).toDestination();
+    // Master chain: filter → chorus → reverb → limiter → destination
+    this.limiter = new Tone.Limiter(-3).toDestination(); // Prevent clipping
+    this.reverb = new Tone.Reverb({ decay: 12, wet: 0.6 }).connect(this.limiter);
     this.chorus = new Tone.Chorus({ frequency: 0.3, delayTime: 3.5, depth: 0.7, wet: 0.4 });
     this.chorus.start();
     this.filter = new Tone.Filter({ frequency: 400, type: 'lowpass', rolloff: -24 });
@@ -99,31 +100,31 @@ export default class AudioEngine {
         oscillator: { type: 'sine' },
         envelope: { attack: 2.0, decay: 1, sustain: 1, release: 3 },
         note: 'C2',  // Lower, warm tone - depth mapped
-        maxVol: -2, // Very loud (was -12)
+        maxVol: -12, // Reduced from -2 to prevent distortion
       },
       cephalopod: {
         oscillator: { type: 'fmsine', modulationIndex: 8 }, // More modulation
         envelope: { attack: 1.5, decay: 1, sustain: 1, release: 2.5 },
         note: 'G#3', // Eerie dissonant tone - depth mapped
-        maxVol: -3, // Very loud (was -13)
+        maxVol: -14, // Reduced from -3 to prevent distortion
       },
       plant: {
         oscillator: { type: 'triangle' },
         envelope: { attack: 3.0, decay: 1.5, sustain: 1, release: 4 }, // Slower attack
         note: 'E5',  // High, airy - depth mapped
-        maxVol: 0, // Maximum volume (was -10)
+        maxVol: -10, // Reduced from 0 to prevent distortion
       },
       crustacean: {
         oscillator: { type: 'square', partialCount: 5 }, // More harmonics
         envelope: { attack: 1.8, decay: 1, sustain: 1, release: 2 },
         note: 'D3',  // Mid-range, buzzy - depth mapped
-        maxVol: -5, // Very loud (was -15)
+        maxVol: -16, // Reduced from -5 to prevent distortion
       },
       fish: {
         oscillator: { type: 'sawtooth' }, // Richer tone
         envelope: { attack: 2.5, decay: 1.2, sustain: 0.9, release: 3.5 },
         note: 'A3',  // Brighter mid-range - depth mapped
-        maxVol: -3, // Very loud (was -13)
+        maxVol: -14, // Reduced from -3 to prevent distortion
       },
     };
     return configs[category] || configs.mammal;
@@ -182,21 +183,46 @@ export default class AudioEngine {
       }
     }
 
+    // Count species per category to prevent stacking distortion
+    const categoryProximities = {};
+    for (const [id, { species, proximity }] of Object.entries(proximityMap)) {
+      const cat = species.category;
+      if (!categoryProximities[cat]) {
+        categoryProximities[cat] = { total: 0, count: 0, max: 0 };
+      }
+      categoryProximities[cat].total += proximity;
+      categoryProximities[cat].count += 1;
+      categoryProximities[cat].max = Math.max(categoryProximities[cat].max, proximity);
+    }
+
     // Update gain for all active layers
     for (const [id, layer] of Object.entries(this.zoneLayers)) {
       const entry = proximityMap[id];
-      const targetGain = entry ? entry.proximity : 0;
 
-      // Smooth ramp to target gain
-      try {
-        layer.gain.gain.linearRampTo(targetGain, 0.15);
-      } catch (_) {
-        // Safety: if node is disposed
-      }
+      if (entry) {
+        const cat = layer.category;
+        const catData = categoryProximities[cat];
 
-      // Cleanup layers that have been silent for a while
-      if (!entry || entry.proximity === 0) {
-        layer.gain.gain.linearRampTo(0, 0.5);
+        // Use a blend of max proximity and average to prevent harsh stacking
+        // When multiple species are near, use max but reduce overall gain
+        const stackingFactor = Math.min(1, 1.5 / catData.count); // Reduces as more species stack
+        const blendedProximity = catData.max * stackingFactor;
+
+        // Apply smoothed gain curve to make it less aggressive
+        const smoothGain = Math.pow(blendedProximity, 1.5); // Softer curve
+
+        // Smooth ramp to target gain
+        try {
+          layer.gain.gain.linearRampTo(smoothGain, 0.2);
+        } catch (_) {
+          // Safety: if node is disposed
+        }
+      } else {
+        // Cleanup layers that have been silent for a while
+        try {
+          layer.gain.gain.linearRampTo(0, 0.5);
+        } catch (_) {}
+
         // Don't dispose immediately — let release tail finish
         setTimeout(() => {
           if (this.zoneLayers[id] === layer) {
